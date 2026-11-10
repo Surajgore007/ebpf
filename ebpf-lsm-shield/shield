@@ -1,0 +1,640 @@
+#!/usr/bin/env python3
+import json, os, signal, subprocess, sys, time
+from collections import defaultdict
+from pathlib import PurePosixPath
+from pathlib import Path
+from measurement.file_identity import resolve_path
+from measurement.decoys import DecoyManager
+from measurement.entropy import (
+    SAMPLE_SIZE,
+    compute_entropy_ratio,
+    is_lab_path,
+    sample_file_prefix,
+    shannon_entropy_fixed,
+)
+
+ROOT = Path(__file__).resolve().parent
+CONFIG = json.loads((ROOT / "config" / "detector.json").read_text())
+WINDOW_NS = int(CONFIG["window_seconds"] * 1_000_000_000)
+USE_COLOR = sys.stdout.isatty() or os.environ.get("SHIELD_COLOR") == "1"
+RESET = "\033[0m" if USE_COLOR else ""
+DIM = "\033[2m" if USE_COLOR else ""
+CYAN = "\033[96m" if USE_COLOR else ""
+BLUE = "\033[94m" if USE_COLOR else ""
+GREEN = "\033[92m" if USE_COLOR else ""
+YELLOW = "\033[93m" if USE_COLOR else ""
+RED = "\033[91m" if USE_COLOR else ""
+WHITE = "\033[97m" if USE_COLOR else ""
+CLEAR = "\033[2J\033[H" if USE_COLOR else ""
+
+
+def path_value(value):
+    if not value or value == "-":
+        return None
+    return os.path.normpath(value.replace("\\t", " ").replace("\\n", " "))
+
+
+def ext(path):
+    suffix = PurePosixPath(path).suffix.lower()
+    return suffix or "[no-extension]"
+
+
+def parent(path):
+    p = PurePosixPath(path).parent
+    return str(p) if str(p) else "."
+
+
+def identity_key(path, identity):
+    if identity is not None:
+        return identity.key()
+    return f"path:{path}"
+
+
+def new_file_window(file_key, path, identity=None):
+    return {
+        "file_key": file_key,
+        "identity": identity,
+        "path": path,
+        "paths": {path} if path else set(),
+        "pids": set(),
+        "comm_by_pid": {},
+        "opens": 0,
+        "reads": 0,
+        "writes": 0,
+        "bytes_read": 0,
+        "bytes_written": 0,
+        "renames": 0,
+        "deletes": 0,
+        "truncates": 0,
+        "ftruncates": 0,
+        "fallocates": 0,
+        "read_entropy_samples": [],
+        "write_entropy_samples": [],
+        "is_fallback": identity is None,
+        "is_decoy": False,
+        "decoy_touched": False,
+        "decoy_operations": 0,
+    }
+
+
+def get_file_window(window_files, file_key, path, identity, decoy_mgr=None):
+    if file_key not in window_files:
+        window_files[file_key] = new_file_window(file_key, path, identity)
+    fw = window_files[file_key]
+    if path:
+        fw["path"] = path
+        fw["paths"].add(path)
+    if identity is not None and fw["identity"] is None:
+        fw["identity"] = identity
+        fw["is_fallback"] = False
+    if decoy_mgr and not fw["is_decoy"]:
+        if decoy_mgr.is_decoy(fkey=file_key, path=path):
+            fw["is_decoy"] = True
+    return fw
+
+
+def sample_fw_prefix(fw, path, max_len=SAMPLE_SIZE):
+    if path and is_lab_path(path):
+        buf = sample_file_prefix(path, max_len)
+        if buf:
+            return buf
+    curr = fw.get("path")
+    if curr and curr != path and is_lab_path(curr):
+        buf = sample_file_prefix(curr, max_len)
+        if buf:
+            return buf
+    for p in fw.get("paths", ()):
+        if p and p != path and p != curr and is_lab_path(p):
+            buf = sample_file_prefix(p, max_len)
+            if buf:
+                return buf
+    return None
+
+
+def score_window(file_dict):
+    p = CONFIG["prototype_parameters"]
+    b = CONFIG["baseline_reference"]
+    files = list(file_dict.values())
+
+    files_opened = [f for f in files if f["opens"] > 0]
+    files_written = [f for f in files if f["writes"] > 0]
+    files_modified = [f for f in files if f["writes"] > 0 or f["truncates"] > 0 or f["ftruncates"] > 0 or f["fallocates"] > 0]
+    files_renamed = [f for f in files if f["renames"] > 0]
+    files_deleted = [f for f in files if f["deletes"] > 0]
+
+    modified = len(files_modified)
+    wr = sum(f["writes"] for f in files)
+    renames = sum(f["renames"] for f in files)
+    deletes = sum(f["deletes"] for f in files)
+    opens = sum(f["opens"] for f in files)
+    bytes_written = sum(f["bytes_written"] for f in files)
+    truncates = sum(f["truncates"] for f in files)
+    ftruncates = sum(f["ftruncates"] for f in files)
+    fallocates = sum(f["fallocates"] for f in files)
+
+    mps = modified / CONFIG["window_seconds"]
+    wps = wr / CONFIG["window_seconds"]
+    ratio = renames / wr if wr else None
+
+    modified_paths = {f["path"] for f in files_modified if f["path"]}
+    types = len({ext(x) for x in modified_paths})
+    dirs = len({parent(x) for x in modified_paths})
+
+    # First-class Multi-Process Tracking
+    process_counts = [len(f["pids"]) for f in files]
+    max_pids_per_file = max(process_counts) if process_counts else 0
+    mean_pids_per_file = (sum(process_counts) / len(process_counts)) if process_counts else 0.0
+    multi_proc_files = [f for f in files if len(f["pids"]) > 1]
+    multi_proc_count = len(multi_proc_files)
+
+    all_pids = set.union(*(f["pids"] for f in files)) if files else set()
+    contributing_pids = set.union(*(f["pids"] for f in files_modified)) if files_modified else all_pids
+    comm_map = {}
+    for f in files:
+        for pid, comm in f["comm_by_pid"].items():
+            comm_map[pid] = comm
+
+    indicators = []
+    broad = modified >= p["broad_modified_minimum"]
+    high_write = wps >= b["writes_per_second_p95_high_activity"] * p["high_write_fraction_of_reference"]
+    rapid_rename = renames >= p["rename_minimum"]
+    transform_ratio = ratio is not None and ratio >= p["rename_write_ratio_minimum"]
+    type_breadth = types >= p["type_diversity_minimum"]
+    multi_process_signal = multi_proc_count > 0 or (len(all_pids) > 1 and broad)
+
+    if broad:
+        indicators.append("broad file coverage")
+    if high_write:
+        indicators.append("high write rate")
+    if rapid_rename:
+        indicators.append("rapid rename activity")
+    if transform_ratio:
+        indicators.append("rename/write transformation relationship")
+    if type_breadth:
+        indicators.append("broad file-type coverage")
+    if multi_process_signal:
+        indicators.append("multi-process coordination")
+
+    all_read_entropy = [s for f in files for s in f.get("read_entropy_samples", [])]
+    all_write_entropy = [s for f in files for s in f.get("write_entropy_samples", [])]
+    mean_read_entropy = (sum(all_read_entropy) / len(all_read_entropy)) if all_read_entropy else None
+    mean_write_entropy = (sum(all_write_entropy) / len(all_write_entropy)) if all_write_entropy else None
+    entropy_ratio = (
+        compute_entropy_ratio(int(mean_read_entropy), int(mean_write_entropy))
+        if (mean_read_entropy is not None and mean_write_entropy is not None and mean_write_entropy > 0)
+        else None
+    )
+
+    # Phase 4 Decoy / Canary Tracking
+    decoy_touched_files = [f for f in files if f.get("is_decoy") and f.get("decoy_touched")]
+    decoy_touch_count = len(decoy_touched_files)
+    decoy_operations = sum(f.get("decoy_operations", 0) for f in files)
+    compromised_names = sorted(list({Path(f["path"]).name for f in decoy_touched_files if f.get("path")}))
+
+    if decoy_touch_count > 0:
+        indicators.append("canary decoy file compromise")
+
+    transformation = rapid_rename and transform_ratio
+    return {
+        "modified": modified,
+        "writes": wr,
+        "opens": opens,
+        "renames": renames,
+        "deletes": deletes,
+        "bytes_written": bytes_written,
+        "truncates": truncates,
+        "ftruncates": ftruncates,
+        "fallocates": fallocates,
+        "unique_opened": len(files_opened),
+        "unique_written": len(files_written),
+        "wps": wps,
+        "mps": mps,
+        "ratio": ratio,
+        "types": types,
+        "dirs": dirs,
+        "mean_read_entropy": mean_read_entropy,
+        "mean_write_entropy": mean_write_entropy,
+        "entropy_ratio": entropy_ratio,
+        "max_pids_per_file": max_pids_per_file,
+        "mean_pids_per_file": mean_pids_per_file,
+        "multi_proc_count": multi_proc_count,
+        "all_pids": all_pids,
+        "contributing_pids": contributing_pids,
+        "comm_map": comm_map,
+        "indicators": indicators,
+        "broad": broad,
+        "transformation": transformation,
+        "multi_process_signal": multi_process_signal,
+        "decoy_touch_count": decoy_touch_count,
+        "decoy_operations": decoy_operations,
+        "compromised_names": compromised_names,
+        "total_files": len(files),
+    }
+
+
+def classify(f, streak):
+    # Phase 4: Canary / Decoy Honeypot tripwire escalation
+    if f.get("decoy_touch_count", 0) > 0:
+        return "HIGH RISK"
+    p = CONFIG["prototype_parameters"]
+    combined = f["broad"] and f["transformation"]
+    if combined and streak >= CONFIG["confirmation_windows"]:
+        return "HIGH RISK"
+    if combined or (f["broad"] and len(f["indicators"]) >= p["suspicious_indicator_minimum"]):
+        return "SUSPICIOUS"
+    return "LOW / BENIGN"
+
+
+def styled_state(state):
+    color = RED if state == "HIGH RISK" else YELLOW if state == "SUSPICIOUS" else GREEN
+    return f"{color}{state}{RESET}"
+
+
+def line(text="", width=78):
+    print(f"{CYAN}│{RESET} {text:<{width-3}}{CYAN}│{RESET}")
+
+
+def show_window(f, streak, previous, state, active_canaries=0):
+    now = time.strftime("%Y-%m-%d %H:%M:%S %Z")
+    ratio = f["ratio"] if f["ratio"] is not None else 0.0
+    wmf = f["writes"] / f["modified"] if f["modified"] else 0.0
+    write_open = f["writes"] / f["opens"] if f["opens"] else 0.0
+    transition = f"{previous}  →  {state}" if previous and previous != state else f"{state} (updated)"
+
+    pids_sorted = sorted(f["contributing_pids"] or f["all_pids"])
+    if len(pids_sorted) == 1:
+        pid = pids_sorted[0]
+        proc_str = f"PID: {WHITE}{pid}{RESET}   PROCESS: {WHITE}{f['comm_map'].get(pid, '?')}{RESET}"
+    elif len(pids_sorted) > 1:
+        comms = sorted({f['comm_map'].get(p, '?') for p in pids_sorted})
+        proc_str = f"PIDS: {WHITE}{len(pids_sorted)} cooperating{RESET} ({','.join(str(p) for p in pids_sorted[:4])})   COMM: {WHITE}{','.join(comms)}{RESET}"
+    else:
+        proc_str = f"PIDS: {DIM}none{RESET}   PROCESS: {DIM}idle{RESET}"
+
+    print(CLEAR, end="")
+    print(f"{CYAN}┌──────────────────────────────────────────────────────────────────────────────┐{RESET}")
+    line(f"{WHITE}{'eBPF LSM SHIELD':^75}{RESET}")
+    line(f"{DIM}{'File-Centric Kernel Behavioral Threat Detection Engine':^75}{RESET}")
+    print(f"{CYAN}├──────────────────────────────────────────────────────────────────────────────┤{RESET}")
+    line(f"STATUS: {GREEN}● MONITORING{RESET}   {DIM}{now}{RESET}")
+    line(f"{proc_str}   WINDOW: {CONFIG['window_seconds']:.0f}s")
+    line(f"Risk Level:        {styled_state(state)}")
+    line(f"State Transition:  {transition}")
+    line(f"Suspicious Streak: {streak} / {CONFIG['confirmation_windows']}")
+    print(f"{CYAN}├──────────────────────────────────────────────────────────────────────────────┤{RESET}")
+    line(f"{WHITE}DECOY / HONEYPOT INTEGRITY MONITOR{RESET}")
+    canary_status = (
+        f"{RED}⚠ COMPROMISED ({', '.join(f.get('compromised_names', []))}){RESET}"
+        if f.get("decoy_touch_count", 0) > 0
+        else f"{GREEN}● SECURE (0 touches){RESET}"
+    )
+    line(f"Active Canaries:      {active_canaries:>6} deployed (inode tracking)")
+    line(f"Tripwire Status:      {canary_status}")
+    line(f"Canary Operations:    {f.get('decoy_operations', 0):>6}")
+    print(f"{CYAN}├──────────────────────────────────────────────────────────────────────────────┤{RESET}")
+    line(f"{WHITE}CROSS-PROCESS INODE AGGREGATION{RESET}")
+    line(f"Max Processes / File: {f['max_pids_per_file']:>6}")
+    line(f"Multi-Process Files:  {f['multi_proc_count']:>6}")
+    line(f"Total Active PIDs:    {len(f['all_pids']):>6}")
+    print(f"{CYAN}├──────────────────────────────────────────────────────────────────────────────┤{RESET}")
+    line(f"{WHITE}FILE-CENTRIC BEHAVIORAL TELEMETRY{RESET}")
+    line(f"Files Modified (ids): {f['modified']:>6}")
+    line(f"Modified Files/sec:   {f['mps']:>6.1f}")
+    line(f"Writes/sec:           {f['wps']:>6.1f}")
+    line(f"Bytes Written/sec:    {f['bytes_written'] / CONFIG['window_seconds']:>6.1f}")
+    line(f"Truncate ops:         {f['truncates']:>6}")
+    line(f"Ftruncate ops:        {f['ftruncates']:>6}")
+    line(f"Fallocate ops:        {f['fallocates']:>6}")
+    line(f"Unique Files Opened:  {f['unique_opened']:>6}")
+    line(f"Unique Files Written: {f['unique_written']:>6}")
+    line(f"Renames:              {f['renames']:>6}")
+    line(f"Deletes:              {f['deletes']:>6}")
+    line(f"Writes/Modified File: {wmf:>6.2f}")
+    line(f"Write/Open Ratio:     {write_open:>6.3f}")
+    line(f"Rename/Write Ratio:   {ratio:>6.3f}")
+    entropy_str = f"{f['entropy_ratio']:.4f}" if f.get("entropy_ratio") is not None else "N/A"
+    h_read_str = f"{f['mean_read_entropy']/1000:.3f} b/B" if f.get("mean_read_entropy") is not None else "N/A"
+    h_write_str = f"{f['mean_write_entropy']/1000:.3f} b/B" if f.get("mean_write_entropy") is not None else "N/A"
+    line(f"Read Entropy:         {h_read_str:>10}")
+    line(f"Write Entropy:        {h_write_str:>10}")
+    line(f"Entropy Ratio (R/W):  {entropy_str:>10}")
+    line(f"Directory Breadth:    {f['dirs']:>6}")
+    line(f"File-Type Diversity:  {f['types']:>6}")
+    print(f"{CYAN}├──────────────────────────────────────────────────────────────────────────────┤{RESET}")
+    line(f"{WHITE}DETECTION EVIDENCE{RESET}")
+    evidence = set(f["indicators"])
+    labels = [
+        ("canary decoy file compromise", "Canary decoy compromise (TRIPWIRE)"),
+        ("broad file coverage", "Broad file coverage"),
+        ("rapid rename activity", "Rapid rename activity"),
+        ("rename/write transformation relationship", "Transformation relationship"),
+        ("multi-process coordination", "Multi-process coordination"),
+        ("broad file-type coverage", "Broad file-type coverage"),
+        ("high write rate", "High write rate")
+    ]
+    for key, label in labels:
+        mark = f"{GREEN}✓{RESET}" if key in evidence else f"{DIM}·{RESET}"
+        line(f"{mark} {label}")
+    persistent = streak >= CONFIG["confirmation_windows"] and f["broad"] and f["transformation"]
+    mark = f"{GREEN}✓{RESET}" if persistent else f"{DIM}·{RESET}"
+    line(f"{mark} Persistent across {streak} windows")
+    print(f"{CYAN}├──────────────────────────────────────────────────────────────────────────────┤{RESET}")
+    if state == "HIGH RISK":
+        line(f"{RED}⚠ SECURITY ALERT{RESET}")
+        if f.get("decoy_touch_count", 0) > 0:
+            line(f"{RED}Canary honeypot tripwire triggered! Instant escalation.{RESET}")
+        else:
+            line(f"{RED}Broad + rapid transformation detected{RESET}")
+    elif state == "SUSPICIOUS":
+        line(f"{YELLOW}▲ SUSPICIOUS ACTIVITY{RESET}")
+        line(f"{YELLOW}Combined behavioral indicators observed{RESET}")
+    else:
+        line(f"{GREEN}✓ NORMAL ACTIVITY{RESET}")
+        line(f"{DIM}No combined transformation indicators{RESET}")
+    line(f"{DIM}POLICY: AUDIT-ONLY — NO BLOCKING{RESET}")
+    print(f"{CYAN}└──────────────────────────────────────────────────────────────────────────────┘{RESET}")
+    sys.stdout.flush()
+
+
+def main():
+    bt = ROOT / "measurement" / "file_activity.bt"
+    proc = subprocess.Popen(["stdbuf", "-o0", "-e0", "bpftrace", str(bt)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+
+    import threading
+    def _drain_stderr():
+        try:
+            for _ in proc.stderr:
+                pass
+        except Exception:
+            pass
+    threading.Thread(target=_drain_stderr, daemon=True).start()
+
+    decoy_mgr = DecoyManager(str(ROOT / "config" / "detector.json"))
+    decoy_mgr.deploy()
+
+    # File-centric window grouping: windows[index][file_key] -> FileWindow dict
+    windows = defaultdict(dict)
+    streak = 0
+    previous_state = None
+    first = None
+    ready = False
+    fd_identities = {}
+    path_identities = {}
+    known_file_entropy = {}
+    pending_operations = {}
+    my_pid = os.getpid()
+
+    def handle(line_text):
+        nonlocal first, ready, streak, previous_state
+        line_text = line_text.rstrip("\r\n")
+        if line_text == "READY":
+            ready = True
+            return
+        fields = line_text.split("\t")
+        if not fields:
+            return
+        if fields[0] == "TICK":
+            now = int(fields[1])
+            if first is None:
+                first = now - WINDOW_NS
+            for idx in sorted(list(windows.keys())):
+                if idx < (now - first) // WINDOW_NS:
+                    file_dict = windows.pop(idx)
+                    # Filter out self
+                    for f in list(file_dict.values()):
+                        f["pids"].discard(my_pid)
+                    active_files = {k: f for k, f in file_dict.items() if f["pids"] or f["writes"] > 0 or f["opens"] > 0}
+                    if not active_files:
+                        continue
+                    f = score_window(active_files)
+                    if f["broad"] and f["transformation"]:
+                        streak += 1
+                    else:
+                        streak = 0
+                    state = classify(f, streak)
+                    show_window(f, streak, previous_state, state, len(decoy_mgr.deployed_files))
+                    previous_state = state
+            return
+
+        if fields[0] != "EV" or len(fields) < 6:
+            return
+        ts = int(fields[1]); pid = int(fields[2]); comm = fields[3]; kind = fields[4]
+        if comm == "bpftrace" or pid == my_pid:
+            return
+        if first is None:
+            first = (ts // WINDOW_NS) * WINDOW_NS
+        idx = (ts - first) // WINDOW_NS
+
+        if kind == "P" and len(fields) >= 9:
+            pending_tid = int(fields[5])
+            if len(pending_operations) >= 4096:
+                pending_operations.pop(next(iter(pending_operations)))
+            pending_operations[(pid, pending_tid)] = (
+                fields[6], int(fields[7]), path_value("\t".join(fields[8:])))
+            return
+
+        if kind == "S" and len(fields) >= 7:
+            pending_tid = int(fields[5])
+            pending = pending_operations.pop((pid, pending_tid), None)
+            if pending is None:
+                return
+            subtype, fd, x = pending
+            identity = fd_identities.get((pid, fd)) if fd >= 0 else None
+            if identity is None and x:
+                identity = path_identities.get((pid, x)) or resolve_path(x)
+            fkey = identity_key(x, identity)
+            fw = get_file_window(windows[idx], fkey, x, identity, decoy_mgr)
+            fw["pids"].add(pid)
+            fw["comm_by_pid"][pid] = comm
+
+            if subtype == "RD":
+                bytes_read = max(int(fields[6]), 0)
+                fw["reads"] = fw.get("reads", 0) + 1
+                fw["bytes_read"] = fw.get("bytes_read", 0) + bytes_read
+                if is_lab_path(x) and len(fw["read_entropy_samples"]) < 5:
+                    ent = known_file_entropy.get(fkey)
+                    if ent is None:
+                        buf = sample_file_prefix(x)
+                        if buf:
+                            ent = shannon_entropy_fixed(buf)
+                            known_file_entropy[fkey] = ent
+                    if ent is not None:
+                        fw["read_entropy_samples"].append(ent)
+            elif subtype == "W":
+                bytes_written = max(int(fields[6]), 0)
+                fw["writes"] += 1
+                fw["bytes_written"] += bytes_written
+                if fw.get("is_decoy") or decoy_mgr.is_decoy(fkey, x):
+                    fw["is_decoy"] = True
+                    fw["decoy_touched"] = True
+                    fw["decoy_operations"] += 1
+                if is_lab_path(x) and len(fw["write_entropy_samples"]) < 5:
+                    buf = sample_fw_prefix(fw, x)
+                    if buf:
+                        ent = shannon_entropy_fixed(buf)
+                        fw["write_entropy_samples"].append(ent)
+                        known_file_entropy[fkey] = ent
+            elif subtype == "T":
+                fw["truncates"] += 1
+                if fw.get("is_decoy") or decoy_mgr.is_decoy(fkey, x):
+                    fw["is_decoy"] = True
+                    fw["decoy_touched"] = True
+                    fw["decoy_operations"] += 1
+            elif subtype == "F":
+                fw["ftruncates"] += 1
+                if fw.get("is_decoy") or decoy_mgr.is_decoy(fkey, x):
+                    fw["is_decoy"] = True
+                    fw["decoy_touched"] = True
+                    fw["decoy_operations"] += 1
+            elif subtype == "A":
+                fw["fallocates"] += 1
+                if fw.get("is_decoy") or decoy_mgr.is_decoy(fkey, x):
+                    fw["is_decoy"] = True
+                    fw["decoy_touched"] = True
+                    fw["decoy_operations"] += 1
+            return
+
+        if kind == "O":
+            fd = int(fields[5]) if len(fields) >= 7 else None
+            x = path_value("\t".join(fields[6:] if fd is not None else fields[5:]))
+            identity = resolve_path(x) if x else None
+            if identity is None and x:
+                identity = path_identities.get((pid, x))
+            if fd is not None:
+                fd_identities[(pid, fd)] = identity
+            if x and identity is not None:
+                path_identities[(pid, x)] = identity
+            fkey = identity_key(x, identity)
+            fw = get_file_window(windows[idx], fkey, x, identity, decoy_mgr)
+            fw["pids"].add(pid)
+            fw["comm_by_pid"][pid] = comm
+            fw["opens"] += 1
+            if is_lab_path(x) and fkey not in known_file_entropy:
+                buf = sample_file_prefix(x)
+                if buf:
+                    known_file_entropy[fkey] = shannon_entropy_fixed(buf)
+
+        elif kind == "W":
+            fd = int(fields[5]) if len(fields) >= 8 else None
+            bytes_written = max(int(fields[6]), 0) if fd is not None else 0
+            x = path_value("\t".join(fields[7:] if fd is not None else fields[5:]))
+            identity = fd_identities.get((pid, fd)) if fd is not None and fd >= 0 else None
+            if identity is None and x:
+                identity = path_identities.get((pid, x)) or resolve_path(x)
+            fkey = identity_key(x, identity)
+            fw = get_file_window(windows[idx], fkey, x, identity, decoy_mgr)
+            fw["pids"].add(pid)
+            fw["comm_by_pid"][pid] = comm
+            fw["writes"] += 1
+            fw["bytes_written"] += bytes_written
+            if fw.get("is_decoy") or decoy_mgr.is_decoy(fkey, x):
+                fw["is_decoy"] = True
+                fw["decoy_touched"] = True
+                fw["decoy_operations"] += 1
+            if is_lab_path(x) and len(fw["write_entropy_samples"]) < 5:
+                buf = sample_fw_prefix(fw, x)
+                if buf:
+                    ent = shannon_entropy_fixed(buf)
+                    fw["write_entropy_samples"].append(ent)
+                    known_file_entropy[fkey] = ent
+
+        elif kind == "R":
+            a = path_value(fields[5])
+            b = path_value("\t".join(fields[6:]))
+            identity = path_identities.get((pid, a)) if a else None
+            if identity is None and b:
+                identity = resolve_path(b)
+            if identity is None and a:
+                identity = resolve_path(a)
+            target = b or a
+            fkey = identity_key(target, identity)
+            fw = get_file_window(windows[idx], fkey, target, identity, decoy_mgr)
+            fw["pids"].add(pid)
+            fw["comm_by_pid"][pid] = comm
+            fw["renames"] += 1
+            if a:
+                fw["paths"].add(a)
+                old_ident = path_identities.pop((pid, a), None)
+                old_fkey = identity_key(a, old_ident)
+                if old_fkey in known_file_entropy and fkey not in known_file_entropy:
+                    known_file_entropy[fkey] = known_file_entropy[old_fkey]
+            if b and identity:
+                fw["paths"].add(b)
+                fw["path"] = b
+                path_identities[(pid, b)] = identity
+            if fw.get("is_decoy") or decoy_mgr.is_decoy(fkey, target) or (a and decoy_mgr.is_decoy(path=a)):
+                fw["is_decoy"] = True
+                fw["decoy_touched"] = True
+                fw["decoy_operations"] += 1
+            if is_lab_path(target) and not fw["write_entropy_samples"]:
+                buf = sample_fw_prefix(fw, target)
+                if buf:
+                    ent = shannon_entropy_fixed(buf)
+                    fw["write_entropy_samples"].append(ent)
+                    known_file_entropy[fkey] = ent
+
+        elif kind == "D":
+            x = path_value("\t".join(fields[5:]))
+            identity = path_identities.pop((pid, x), None) if x else None
+            if identity is None and x:
+                identity = resolve_path(x)
+            fkey = identity_key(x, identity)
+            fw = get_file_window(windows[idx], fkey, x, identity, decoy_mgr)
+            fw["pids"].add(pid)
+            fw["comm_by_pid"][pid] = comm
+            fw["deletes"] += 1
+            if fw.get("is_decoy") or decoy_mgr.is_decoy(fkey, x):
+                fw["is_decoy"] = True
+                fw["decoy_touched"] = True
+                fw["decoy_operations"] += 1
+
+        elif kind in ("T", "F", "A"):
+            fd = int(fields[5]) if kind in ("F", "A") and len(fields) >= 7 else None
+            x = path_value("\t".join(fields[6:] if fd is not None else fields[5:]))
+            identity = fd_identities.get((pid, fd)) if fd is not None else None
+            if identity is None:
+                identity = path_identities.get((pid, x)) if x else None
+            if identity is None and x:
+                identity = resolve_path(x)
+            fkey = identity_key(x, identity)
+            fw = get_file_window(windows[idx], fkey, x, identity, decoy_mgr)
+            fw["pids"].add(pid)
+            fw["comm_by_pid"][pid] = comm
+            if fw.get("is_decoy") or decoy_mgr.is_decoy(fkey, x):
+                fw["is_decoy"] = True
+                fw["decoy_touched"] = True
+                fw["decoy_operations"] += 1
+            if kind == "T":
+                fw["truncates"] += 1
+            elif kind == "F":
+                fw["ftruncates"] += 1
+            else:
+                fw["fallocates"] += 1
+
+    try:
+        while not ready:
+            line_text = proc.stdout.readline()
+            if line_text:
+                handle(line_text)
+            elif proc.poll() is not None:
+                raise RuntimeError("bpftrace exited before READY")
+        print(f"{CYAN}eBPF LSM Shield live monitor | tracepoints=LIVE | identity=FILE-CENTRIC | scoring=PROTOTYPE{RESET}")
+        print(f"{CYAN}Decoy/Canary Honeypot: {len(decoy_mgr.deployed_files)} canaries deployed in /tmp/ebpf_shield_canaries{RESET}")
+        print(f"{DIM}Waiting for filesystem activity... Ctrl-C to stop.{RESET}")
+        sys.stdout.flush()
+        for line_text in proc.stdout:
+            handle(line_text)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        decoy_mgr.cleanup()
+        proc.send_signal(signal.SIGINT)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+if __name__ == "__main__":
+    main()

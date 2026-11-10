@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials/
+
+# Runtime output
+*.log
+*.jsonl
+*.pid
+*.sock
+experiments/local/
+experiments/results/
+experiments/results_*/
+
+# Generated and machine-specific eBPF artifacts
+*.o
+*.ko
+*.ll
+*.bc
+*.dump
+
+# Local VM, backup, and temporary material
+*-backup-*/
+backup-*/
+*.qcow2
+*.vdi
+*.vmdk
+*.ova
+.tmp/
+tmp/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.example.json

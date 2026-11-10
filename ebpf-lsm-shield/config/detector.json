@@ -1,0 +1,34 @@
+{
+  "window_seconds": 2,
+  "confirmation_windows": 3,
+  "mode": "audit",
+  "baseline_reference": {
+    "source": "measured VM benign workload distributions, 2026-10-07",
+    "modified_files_per_second_p95_high_activity": 121.0,
+    "writes_per_second_p95_high_activity": 151.5,
+    "rename_write_ratio_p95_git": 0.4286
+  },
+  "prototype_parameters": {
+    "broad_modified_fraction_of_reference": 0.75,
+    "broad_modified_minimum": 20,
+    "high_write_fraction_of_reference": 0.75,
+    "rename_minimum": 1,
+    "rename_write_ratio_minimum": 0.50,
+    "type_diversity_minimum": 3,
+    "suspicious_indicator_minimum": 2,
+    "high_risk_indicator_minimum": 3
+  },
+  "decoys": {
+    "enabled": true,
+    "directories": [
+      "/tmp/ebpf_shield_canaries"
+    ],
+    "patterns": [
+      ".credentials_2026.docx",
+      "passwords_backup.xlsx",
+      "private_keys.pem",
+      "client_database.db",
+      "financial_ledger.csv"
+    ]
+  }
+}
