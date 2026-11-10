@@ -1,9 +1,9 @@
-workload,windows,pid_processes,unique_files_opened,unique_files_written,unique_files_modified,unique_files_renamed,unique_files_deleted,writes_per_second,modified_files_per_second,writes_per_modified_file,write_open_ratio,rename_write_ratio
-copy,7,10147/python3; 10162/python3; 10177/python3; 6197/upowerd,3.000,0.000,0.000,0.000,1.000,0.000,0.000,1.000,0.000,0.000
-backup,6,10192/python3; 10207/python3; 10222/python3,199.000,80.500,80.500,0.000,81.500,40.250,40.250,1.000,0.144,0.000
-idle,12,1/systemd; 450/systemd-timesyn; 6197/upowerd; 914/bash; 9499/python3; 9501/bash; 9502/ls; 9504/bash; 9505/ls; 9519/python3; 9533/python3,1.000,0.000,0.000,0.000,0.000,0.000,0.000,,0.000,
-editing,12,1/systemd; 9547/python3; 9561/python3; 9575/python3,1.000,1.000,1.000,0.000,0.500,9.000,0.500,24.000,0.271,0.000
-archive,7,9589/python3; 9603/python3; 9617/python3,152.000,121.000,121.000,0.000,1.000,68.000,60.500,1.252,0.346,0.000
-git-checkout,37,1/systemd; 9673/python3; 9674/git; 9675/git; 9676/git; 9677/git; 9678/git; 9679/git; 9680/git; 9681/git; 9682/git; 9696/python3; 9697/git; 9698/git; 9699/git; 9700/git; 9701/git; 9702/git; 9703/git; 9704/git; 9705/git; 9719/python3; 9720/git; 9721/git; 9722/git; 9723/git; 9724/git; 9725/git; 9726/git; 9727/git; 9728/git,124.000,7.000,7.000,2.000,6.000,4.500,3.500,1.286,0.209,0.019
-compile,18,9742/python3; 9743/make; 9744/gcc; 9745/cc1; 9746/as; 9760/python3; 9761/make; 9762/gcc; 9763/cc1; 9764/as; 9778/python3; 9779/make; 9780/gcc; 9781/cc1; 9782/as,8.000,0.500,0.500,0.000,0.500,0.250,0.250,1.000,0.036,0.000
-create,10,1/systemd; 450/systemd-timesyn; 9845/python3; 9859/python3; 9873/python3,1.500,0.000,0.000,0.000,1.000,0.000,0.000,1.000,0.000,0.000
+workload,windows,unique_files_opened,unique_files_written,unique_files_modified,unique_files_renamed,unique_files_deleted,writes_per_second,modified_files_per_second,writes_per_modified_file,write_open_ratio,rename_write_ratio
+copy,7,3.000,0.000,0.000,0.000,1.000,0.000,0.000,1.000,0.000,0.000
+backup,6,199.000,80.500,80.500,0.000,81.500,40.250,40.250,1.000,0.144,0.000
+idle,12,1.000,0.000,0.000,0.000,0.000,0.000,0.000,,0.000,
+editing,12,1.000,1.000,1.000,0.000,0.500,9.000,0.500,24.000,0.271,0.000
+archive,7,152.000,121.000,121.000,0.000,1.000,68.000,60.500,1.252,0.346,0.000
+git-checkout,37,124.000,7.000,7.000,2.000,6.000,4.500,3.500,1.286,0.209,0.019
+compile,18,8.000,0.500,0.500,0.000,0.500,0.250,0.250,1.000,0.036,0.000
+create,10,1.500,0.000,0.000,0.000,1.000,0.000,0.000,1.000,0.000,0.000
